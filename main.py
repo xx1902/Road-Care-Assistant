@@ -1022,6 +1022,36 @@ async def get_base_models(request: Request, user=Depends(get_admin_user)):
     models = await get_all_base_models(request, user=user)
     return {"data": models}
 
+def get_last_user_image(form_data: dict) -> Optional[str]:
+    """
+    从form_data中提取用户最后输入的图片内容。
+    Args:
+        form_data (dict): 包含聊天请求数据的字典。
+    Returns:
+        Optional[str]: 图片内容的Base64编码字符串，如果没有图片则返回None。
+    """
+    # 检查form_data中是否存在files字段
+    if "files" not in form_data:
+        return None
+
+    files = form_data["files"]
+
+    # 确保files是列表
+    if not isinstance(files, list):
+        files = [files]
+
+    # 过滤出类型为image的文件
+    images = [file for file in files if file.get("type") == "image"]
+
+    # 如果没有图片，返回None
+    if not images:
+        return None
+
+    # 获取最后一张图片的内容
+    last_image = images[-1]
+    image_content = last_image.get("content", "")
+
+    return image_content
 
 # 修改消息内容提取逻辑
 def get_text_content(message_content) -> str:
@@ -1149,12 +1179,46 @@ async def chat_completion(
     form_data: dict,
     user=Depends(get_verified_user),
 ):
+    
+    # 打印form_data以查看其结构
+    print("Form Data:", json.dumps(form_data, indent=2))
+
     # 安全获取用户文本输入
     user_messages = [msg for msg in form_data.get("messages", []) if msg["role"] == "user"]
     last_user_message = ""
     if user_messages:
         last_message_content = user_messages[-1].get("content", "")
         last_user_message = get_text_content(last_message_content)  # 使用安全提取方法
+
+    # 获取用户最后上传的图片
+    last_user_image = get_last_user_image(form_data)
+
+    # 如果有图片，进行YOLO检测
+    if last_user_image:
+        try:
+            # 假设图片内容是Base64编码的，需要解码并保存到临时文件
+            image_data = base64.b64decode(last_user_image)
+            temp_image_path = "temp_image.jpg"
+            with open(temp_image_path, "wb") as f:
+                f.write(image_data)
+
+            # 进行YOLO检测
+            detections = yolo_detector.detect(temp_image_path)
+
+            # 将检测结果格式化为用户输入的格式
+            detection_text = "检测到以下物体：\n"
+            for detection in detections:
+                detection_text += f"- {detection['class']} (置信度: {detection['confidence']:.2f}, 位置: {detection['bbox_2d']})\n"
+
+            # 将检测结果作为用户输入
+            last_user_message += "\n" + detection_text
+
+            # 删除临时文件
+            os.remove(temp_image_path)
+        except Exception as e:
+            log.error(f"YOLO检测失败: {e}")
+            last_user_message += "\n图片检测失败"
+
 
     # 生成动态提示词
     system_prompt = generate_dynamic_system_prompt(last_user_message)
