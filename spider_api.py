@@ -90,7 +90,7 @@ def crawler_task(save_dir):
             max_scroll_attempts = 20
             scroll_attempt = 0
             while True:
-                thumbnails = state.browser.find_elements(By.CSS_SELECTOR, "img[jsname='Q4LuWd']")
+                thumbnails = state.browser.find_elements(By.CSS_SELECTOR, "img.YQ4gaf")
                 if len(thumbnails) > last_index + 5 or scroll_attempt >= max_scroll_attempts:
                     break
                 state.browser.execute_script("window.scrollBy(0, 2000)")
