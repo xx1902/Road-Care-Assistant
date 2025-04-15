@@ -12,10 +12,11 @@ import hashlib
 from PIL import Image
 import io
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import imagehash
+import json
+
 
 # 初始化浏览器
 options = webdriver.ChromeOptions()
@@ -31,18 +32,56 @@ search_box.send_keys("car accident")  # 改为中文关键词
 search_box.submit()
 time.sleep(2)
 
-# 滚动加载更多图片
-for _ in range(1):
-    browser.execute_script("window.scrollBy(0, 1000)")
-    time.sleep(1)
+# 新增：断点记录文件路径
+CHECKPOINT_FILE = "crawl_checkpoint.json"
 
-# 等待缩略图加载
-WebDriverWait(browser, 5).until(
-    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "img.YQ4gaf"))
-)
+def load_checkpoint():
+    """加载上次的爬取进度"""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            data = json.load(f)
+            return {
+                "processed_hashes": set(data["processed_hashes"]),
+                "last_index": data["last_index"]
+            }
+    return {
+        "processed_hashes": set(),
+        "last_index": 0
+    }
 
-thumbnails = browser.find_elements(By.CSS_SELECTOR, "img.YQ4gaf")
-print(f"找到 {len(thumbnails)} 张缩略图")
+def save_checkpoint(checkpoint):
+    """保存当前进度"""
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump({
+            "processed_hashes": list(checkpoint["processed_hashes"]),
+            "last_index": checkpoint["last_index"]
+        }, f)
+
+# 加载进度
+checkpoint = load_checkpoint()
+processed_hashes = set(checkpoint["processed_hashes"])
+last_index = checkpoint["last_index"]
+
+
+# 动态滚动加载缩略图
+max_scroll_attempts = 20
+scroll_attempt = 0
+while True:
+    # 获取当前所有缩略图
+    WebDriverWait(browser, 10).until(
+        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "img.YQ4gaf"))
+    )
+    thumbnails = browser.find_elements(By.CSS_SELECTOR, "img.YQ4gaf")
+
+    if len(thumbnails) > last_index or scroll_attempt >= max_scroll_attempts:
+        break
+
+    # 滚动页面
+    browser.execute_script("window.scrollBy(0, 2000)")
+    time.sleep(1.5)
+    scroll_attempt += 1
+
+print(f"找到 {len(thumbnails)} 张缩略图，从索引 {last_index} 开始处理")
 
 # 创建保存目录
 if not os.path.exists("高清图片"):
@@ -51,19 +90,7 @@ if not os.path.exists("高清图片"):
 # 线程安全数据结构
 hash_lock = threading.Lock()
 image_lock = threading.Lock()
-saved_hashes = set()
 phash_set = set()
-
-# 初始化时加载已有哈希
-for filename in os.listdir("高清图片"):
-    if filename.endswith(('.jpg', '.jpeg', '.png')):
-        try:
-            with open(os.path.join("高清图片", filename), 'rb') as f:
-                file_hash = hashlib.md5(f.read()).hexdigest()
-                with hash_lock:
-                    saved_hashes.add(file_hash)
-        except:
-            continue
 
 
 def calculate_phash(image):
@@ -88,9 +115,8 @@ def is_duplicate(img_pil):
 
 
 def download_image(img_url):
-    """下载并保存单张图片"""
+    # 下载图片数据
     try:
-        # 下载图片数据
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
@@ -119,9 +145,10 @@ def download_image(img_url):
         # 计算哈希值
         current_hash = hashlib.md5(img_data).hexdigest()
         with hash_lock:
-            if current_hash in saved_hashes:
+            if current_hash in processed_hashes:
                 print(f"重复哈希: {current_hash[:8]}...")
                 return
+
 
         # 验证图片完整性
         try:
@@ -142,22 +169,23 @@ def download_image(img_url):
         with open(filename, "wb") as f:
             f.write(img_data)
 
-        # 更新全局状态
+
         with hash_lock:
-            saved_hashes.add(current_hash)
+            processed_hashes.add(current_hash)
+            checkpoint["processed_hashes"].add(current_hash)
+            save_checkpoint(checkpoint)
         with image_lock:
             phash_set.add(calculate_phash(img_pil))
 
         print(f"成功保存: {filename}")
-
     except Exception as e:
-        print(f"处理异常: {str(e)}")
-
+        print(f"下载失败: {str(e)}")
 
 # 使用线程池管理并发
 with ThreadPoolExecutor(max_workers=4) as executor:
-    for index, thumbnail in enumerate(thumbnails, 1):
-        print(f"正在处理第 {index}/{len(thumbnails)} 张缩略图")
+    for offset, thumbnail in enumerate(thumbnails[last_index:]):
+        current_index = last_index + offset
+        print(f"正在处理第 {current_index + 1}/{len(thumbnails)} 张缩略图")
 
         try:
             # 过滤小尺寸图片
@@ -170,7 +198,7 @@ with ThreadPoolExecutor(max_workers=4) as executor:
             while retries > 0:
                 try:
                     ActionChains(browser).move_to_element(thumbnail).click().perform()
-                    time.sleep(0.5)
+                    time.sleep(1)
 
                     high_res_img = WebDriverWait(browser, 3).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, "img[jsname='kn3ccd']"))
@@ -179,6 +207,10 @@ with ThreadPoolExecutor(max_workers=4) as executor:
 
                     if img_url:
                         executor.submit(download_image, img_url)
+                        # 更新检查点
+                        with hash_lock:
+                            checkpoint["last_index"] = current_index
+                            save_checkpoint(checkpoint)
                     break
 
                 except StaleElementReferenceException:
